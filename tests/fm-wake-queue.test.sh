@@ -348,12 +348,15 @@ SH
 #   progress <task> <body>     progress marker body is exactly <body>
 #   tick                        one stall cycle finished
 #   defer <task> <row-key> [hold]
-#                              a post-threshold cycle did not alert; with [hold],
-#                              also wait until that observation is [hold] seconds old
-#   ring <task> <row-key>      ring marker records <row-key>
+#                              a cycle at least the stall threshold, or [hold]
+#                              seconds when larger, after the first observation
+#                              finished without alerting
+#   ring <task> <row-key>      ring marker records <row-key> and that tick
+#                              rewrote the progress marker
 #   stall-file <task> <row-key>
 #                              stall marker file records <row-key>
-#   drained <queue>            child queue emptied and the doorbell was submitted
+#   drained <task> <queue>     child queue emptied, the doorbell was submitted,
+#                              and that tick rewrote the progress marker
 #   alert                      the watcher exited on the stall wake
 #   reject                     the watcher exited refusing the stall marker path
 stall_watch_beat_epoch() {
@@ -368,15 +371,69 @@ stall_watch_has_wake() { # <out>
   grep -E '^(signal:|stale:|check:|heartbeat($|:))' "$1" >/dev/null 2>&1
 }
 
+stall_watch_record_met() { # <mode> <marker> <want> <progress> <progress-start> <sent>
+  local mode=$1 marker=$2 want=$3 progress=$4 start=$5 sent=$6
+  case "$mode" in
+    progress)
+      [ "$(cat "$marker" 2>/dev/null || true)" = "$want" ]
+      ;;
+    ring)
+      [ "$(cat "$marker" 2>/dev/null || true)" = "$want" ] \
+        && [ "$(cat "$progress" 2>/dev/null || true)" != "$start" ]
+      ;;
+    stall-file)
+      [ -f "$marker" ] && [ ! -L "$marker" ] \
+        && [ "$(cat "$marker" 2>/dev/null || true)" = "$want" ]
+      ;;
+    drained)
+      [ ! -s "$marker" ] && [ -s "$sent" ] && grep -F '[ENTER]' "$sent" >/dev/null 2>&1 \
+        && [ "$(cat "$progress" 2>/dev/null || true)" != "$start" ]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 secondmate_stall_watch_leg() { # <dir> <leg> <mode> [arg...]
   local dir=$1 leg=$2 mode=$3
   shift 3
   local out="$dir/watch-$leg.out" err="$dir/watch-$leg.err"
-  local beat="$dir/state/.last-watcher-beat"
-  local pid i=0 limit=600 met=0 hold_i=0
-  local marker exact row_key queue task hold=0 threshold=1
+  local beat="$dir/state/.last-watcher-beat" sent="$dir/sent"
+  local pid i=0 limit=600 met=0
+  local marker= want= progress= progress_start= row_key= bound=0
   local body key observed_at=0 first=0 mark=0 mtime
-  local sent
+  case "$mode" in
+    alert|reject|tick)
+      ;;
+    progress)
+      marker="$dir/state/.secondmate-wake-progress-$1"
+      want=$2
+      ;;
+    defer)
+      marker="$dir/state/.secondmate-wake-progress-$1"
+      row_key=$2
+      bound=${FM_SECONDMATE_WAKE_STALL_SECS:-1}
+      [ "${3:-0}" -le "$bound" ] || bound=$3
+      ;;
+    ring)
+      marker="$dir/state/.secondmate-wake-ring-$1"
+      want=$2
+      progress="$dir/state/.secondmate-wake-progress-$1"
+      ;;
+    stall-file)
+      marker="$dir/state/.secondmate-wake-stall-$1"
+      want=$2
+      ;;
+    drained)
+      marker=$2
+      progress="$dir/state/.secondmate-wake-progress-$1"
+      ;;
+    *)
+      fail "unknown stall watch mode: $mode"
+      ;;
+  esac
+  [ -z "$progress" ] || progress_start=$(cat "$progress" 2>/dev/null || true)
   rm -f "$beat"
   "$WATCH" >"$out" 2>"$err" &
   pid=$!
@@ -405,58 +462,10 @@ secondmate_stall_watch_leg() { # <dir> <leg> <mode> [arg...]
         || fail "watcher leg $leg did not refuse the stall marker path: $(cat "$out" 2>/dev/null) $(cat "$err" 2>/dev/null)"
       return 0
       ;;
-    progress)
-      task=$1
-      exact=$2
-      marker="$dir/state/.secondmate-wake-progress-$task"
-      ;;
-    tick)
-      first=0
-      ;;
-    defer)
-      task=$1
-      row_key=$2
-      hold=${3:-0}
-      marker="$dir/state/.secondmate-wake-progress-$task"
-      threshold=${FM_SECONDMATE_WAKE_STALL_SECS:-1}
-      observed_at=0
-      mark=0
-      ;;
-    ring)
-      task=$1
-      row_key=$2
-      marker="$dir/state/.secondmate-wake-ring-$task"
-      ;;
-    stall-file)
-      task=$1
-      row_key=$2
-      marker="$dir/state/.secondmate-wake-stall-$task"
-      ;;
-    drained)
-      queue=$1
-      sent="$dir/sent"
-      ;;
-    *)
-      fail "unknown stall watch mode: $mode"
-      ;;
   esac
   while [ "$i" -lt "$limit" ]; do
     met=0
     case "$mode" in
-      progress)
-        [ "$(cat "$marker" 2>/dev/null || true)" = "$exact" ] && met=1
-        ;;
-      ring)
-        [ "$(cat "$marker" 2>/dev/null || true)" = "$row_key" ] && met=1
-        ;;
-      stall-file)
-        [ -f "$marker" ] && [ ! -L "$marker" ] \
-          && [ "$(cat "$marker" 2>/dev/null || true)" = "$row_key" ] && met=1
-        ;;
-      drained)
-        [ -n "$queue" ] && [ ! -s "$queue" ] && [ -s "$sent" ] \
-          && grep -F '[ENTER]' "$sent" >/dev/null 2>&1 && met=1
-        ;;
       tick)
         if [ -e "$beat" ]; then
           mtime=$(stall_watch_beat_epoch "$beat")
@@ -482,7 +491,7 @@ secondmate_stall_watch_leg() { # <dir> <leg> <mode> [arg...]
           fi
         elif [ -e "$beat" ]; then
           mtime=$(stall_watch_beat_epoch "$beat")
-          if [ "$mtime" -ge $((observed_at + threshold)) ]; then
+          if [ "$mtime" -ge $((observed_at + bound)) ]; then
             if ! is_live_non_zombie "$pid" && stall_watch_has_wake "$out"; then
               met=1
             elif [ "$mark" -gt 0 ] && [ "$mtime" -gt "$mark" ]; then
@@ -496,6 +505,9 @@ secondmate_stall_watch_leg() { # <dir> <leg> <mode> [arg...]
           fail "watcher leg $leg alerted during a deferred busy turn: $(cat "$out")"
         fi
         ;;
+      *)
+        stall_watch_record_met "$mode" "$marker" "$want" "$progress" "$progress_start" "$sent" && met=1
+        ;;
     esac
     if [ "$met" -eq 1 ]; then
       break
@@ -505,19 +517,6 @@ secondmate_stall_watch_leg() { # <dir> <leg> <mode> [arg...]
       # exit does not, so start another watcher against the same fixture.
       wait_for_exit "$pid" 50 || true
       case "$mode" in
-        progress)
-          [ "$(cat "$marker" 2>/dev/null || true)" = "$exact" ] && met=1
-          ;;
-        ring)
-          [ "$(cat "$marker" 2>/dev/null || true)" = "$row_key" ] && met=1
-          ;;
-        stall-file)
-          [ -f "$marker" ] && [ ! -L "$marker" ] \
-            && [ "$(cat "$marker" 2>/dev/null || true)" = "$row_key" ] && met=1
-          ;;
-        drained)
-          [ ! -s "$queue" ] && [ -s "$sent" ] && grep -F '[ENTER]' "$sent" >/dev/null 2>&1 && met=1
-          ;;
         tick)
           stall_watch_has_wake "$out" && met=1
           ;;
@@ -525,8 +524,11 @@ secondmate_stall_watch_leg() { # <dir> <leg> <mode> [arg...]
           if [ "$observed_at" -gt 0 ] && stall_watch_has_wake "$out" \
             && ! grep -F 'secondmate wake-loop stalled' "$out" >/dev/null 2>&1; then
             mtime=$(stall_watch_beat_epoch "$beat")
-            [ "$mtime" -ge $((observed_at + threshold)) ] && met=1
+            [ "$mtime" -ge $((observed_at + bound)) ] && met=1
           fi
+          ;;
+        *)
+          stall_watch_record_met "$mode" "$marker" "$want" "$progress" "$progress_start" "$sent" && met=1
           ;;
       esac
       if [ "$met" -eq 1 ]; then
@@ -543,18 +545,6 @@ secondmate_stall_watch_leg() { # <dir> <leg> <mode> [arg...]
   done
   [ "$met" -eq 1 ] \
     || fail "watcher leg $leg ($mode) did not observe the stall condition: $(cat "$out" 2>/dev/null) $(cat "$err" 2>/dev/null)"
-  if [ "$mode" = defer ] && [ "$hold" -gt 0 ]; then
-    hold_i=0
-    while [ "$hold_i" -lt "$limit" ] && [ "$(date +%s)" -lt $((observed_at + hold)) ]; do
-      if grep -F 'secondmate wake-loop stalled' "$out" >/dev/null 2>&1; then
-        fail "watcher leg $leg alerted before the busy bound: $(cat "$out")"
-      fi
-      sleep 0.1
-      hold_i=$((hold_i + 1))
-    done
-    [ "$(date +%s)" -ge $((observed_at + hold)) ] \
-      || fail "watcher leg $leg did not reach a ${hold}s-old observation"
-  fi
   if is_live_non_zombie "$pid"; then
     kill -TERM "$pid" 2>/dev/null || true
   fi
@@ -879,7 +869,7 @@ test_secondmate_proven_idle_ring_lets_the_child_drain() {
     FM_FAKE_CHILD_WAKE_QUEUE="$sub/state/.wake-queue" \
     FM_SECONDMATE_WAKE_STALL_SECS=1 FM_POLL=1 FM_SIGNAL_GRACE=0 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
-    secondmate_stall_watch_leg "$dir" "ring" drained "$sub/state/.wake-queue"
+    secondmate_stall_watch_leg "$dir" "ring" drained mate "$sub/state/.wake-queue"
   ! grep -F 'secondmate wake-loop stalled' "$dir/watch-ring.out" >/dev/null \
     || fail "a proven-idle mate that drained after the ring still alarmed: $(cat "$dir/watch-ring.out")"
   [ ! -s "$state/.wake-queue" ] \
