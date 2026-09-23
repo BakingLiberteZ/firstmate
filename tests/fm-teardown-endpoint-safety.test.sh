@@ -1044,6 +1044,59 @@ test_duplicate_slot_record_collision_defers_to_the_slot_claim() {
   pass "fm-teardown: a duplicate record collision defers to the slot claim and still refuses without one"
 }
 
+# Finding 1 of the PR review: a crewmate claim can outlive the crewmate's slot
+# being reseeded as a secondmate home, because bin/fm-home-seed.sh takes the
+# slot through Treehouse's durable lease and never writes a slot claim. A
+# duplicate collision that touches the secondmate home must therefore keep the
+# refusal rather than letting the stale claim return the slot out from under it.
+test_secondmate_home_duplicate_never_defers_to_a_stale_crewmate_claim() {
+  local dir id=stale-crewmate other=live-secondmate third=other-task worker
+
+  dir=$(make_case slot-secondmate-stale-claim)
+  mark_case_as_treehouse_pool "$dir"
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=firstmate:fm-$id" "endpoint_task_id=$id" \
+    "worktree=$dir/worktree" "project=$dir/project" "kind=scout"
+  fm_write_meta "$dir/home/state/$other.meta" \
+    "window=firstmate:fm-$other" "endpoint_task_id=$other" \
+    "worktree=$dir/worktree" "home=$dir/worktree" \
+    "project=$dir/project" "kind=secondmate"
+  claim_pool_slot "$dir" "$id"
+  ( cd "$dir/worktree" && exec sleep 30 ) &
+  worker=$!
+
+  assert_refused_without_mutation "$dir" "$id" "stale crewmate claim over a secondmate home"
+  kill -0 "$worker" 2>/dev/null || fail "teardown killed the worker in the secondmate home's slot"
+  assert_present "$dir/home/state/$other.meta" "teardown removed the secondmate home record"
+  assert_present "$dir/pool/1/.fm-slot-owner" "teardown removed the stale crewmate claim"
+  assert_contains "$(cat "$dir/pool/1/.fm-slot-owner")" "task=$id" \
+    "teardown rewrote the stale crewmate claim"
+  assert_contains "$(cat "$dir/stderr")" "$other" \
+    "refusal should name the secondmate home record holding the slot"
+  kill "$worker" 2>/dev/null || true
+  wait "$worker" 2>/dev/null || true
+
+  # A claim naming a third task is the same stale evidence about the secondmate
+  # home, so it also refuses rather than taking the reassignment skip.
+  dir=$(make_case slot-secondmate-other-claim)
+  mark_case_as_treehouse_pool "$dir"
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=firstmate:fm-$id" "endpoint_task_id=$id" \
+    "worktree=$dir/worktree" "project=$dir/project" "kind=scout"
+  fm_write_meta "$dir/home/state/$other.meta" \
+    "window=firstmate:fm-$other" "endpoint_task_id=$other" \
+    "worktree=$dir/worktree" "home=$dir/worktree" \
+    "project=$dir/project" "kind=secondmate"
+  claim_pool_slot "$dir" "$third" "$dir/third-home"
+
+  assert_refused_without_mutation "$dir" "$id" "third-task claim over a secondmate home"
+  assert_present "$dir/home/state/$other.meta" "teardown removed the secondmate home record on a third-task claim"
+  assert_contains "$(cat "$dir/pool/1/.fm-slot-owner")" "task=$third" \
+    "teardown rewrote the third task's claim"
+
+  pass "fm-teardown: a secondmate home in a pool slot is never deferred to a crewmate claim"
+}
+
 # The two states that must never become a false refusal: the task's own claim,
 # and no claim at all (a slot taken before claims existed, or already returned).
 test_own_and_absent_slot_claims_still_tear_down() {
@@ -1465,6 +1518,7 @@ test_cross_home_pool_slot_collision_refuses
 test_sole_slot_record_still_tears_down
 test_reassigned_pool_slot_finishes_own_cleanup_without_touching_the_slot
 test_duplicate_slot_record_collision_defers_to_the_slot_claim
+test_secondmate_home_duplicate_never_defers_to_a_stale_crewmate_claim
 test_own_and_absent_slot_claims_still_tear_down
 test_recorded_endpoint_that_changed_directory_still_tears_down
 test_project_lock_anchors_at_the_local_root_across_home_layouts
