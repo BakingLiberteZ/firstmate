@@ -401,7 +401,7 @@ secondmate_stall_watch_leg() { # <dir> <leg> <mode> [arg...]
   local out="$dir/watch-$leg.out" err="$dir/watch-$leg.err"
   local beat="$dir/state/.last-watcher-beat" sent="$dir/sent"
   local pid i=0 limit=600 met=0
-  local marker= want= progress= progress_start= row_key= bound=0
+  local marker want progress progress_start row_key bound=0
   local body key observed_at=0 first=0 mark=0 mtime
   case "$mode" in
     alert|reject|tick)
