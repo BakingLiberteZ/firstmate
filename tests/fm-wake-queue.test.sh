@@ -347,6 +347,7 @@ SH
 #
 #   progress <task> <body>     progress marker body is exactly <body>
 #   tick                        one stall cycle finished
+#   cleared                     paused queue observation cleared its progress marker
 #   defer <task> <row-key> [hold]
 #                              a cycle at least the stall threshold, or [hold]
 #                              seconds when larger, after the first observation
@@ -405,6 +406,10 @@ secondmate_stall_watch_leg() { # <dir> <leg> <mode> [arg...]
   local body key observed_at=0 first=0 mark=0 mtime
   case "$mode" in
     alert|reject|tick)
+      ;;
+    cleared)
+      marker="$dir/state/.secondmate-wake-progress-mate"
+      printf 'unobserved\n' > "$marker"
       ;;
     progress)
       marker="$dir/state/.secondmate-wake-progress-$1"
@@ -479,6 +484,9 @@ secondmate_stall_watch_leg() { # <dir> <leg> <mode> [arg...]
           met=1
         fi
         ;;
+      cleared)
+        [ ! -e "$marker" ] && met=1
+        ;;
       defer)
         if [ "$observed_at" -eq 0 ]; then
           body=$(cat "$marker" 2>/dev/null || true)
@@ -519,6 +527,9 @@ secondmate_stall_watch_leg() { # <dir> <leg> <mode> [arg...]
       case "$mode" in
         tick)
           stall_watch_has_wake "$out" && met=1
+          ;;
+        cleared)
+          [ ! -e "$marker" ] && met=1
           ;;
         defer)
           if [ "$observed_at" -gt 0 ] && stall_watch_has_wake "$out" \
@@ -579,13 +590,13 @@ EOF
     FM_STATE_OVERRIDE="$state" FM_FAKE_TMUX_WINDOW='firstmate:fm-mate' \
     FM_SECONDMATE_WAKE_STALL_SECS=1 FM_POLL=1 FM_SIGNAL_GRACE=0 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
-    secondmate_stall_watch_leg "$dir" "first" tick
+    secondmate_stall_watch_leg "$dir" "first" cleared
   printf '5000\n' > "$dir/now"
   PATH="$fakebin:$PATH" FM_FAKE_NOW_FILE="$dir/now" FM_HOME="$dir" FM_ROOT_OVERRIDE="$ROOT" \
     FM_STATE_OVERRIDE="$state" FM_FAKE_TMUX_WINDOW='firstmate:fm-mate' \
     FM_SECONDMATE_WAKE_STALL_SECS=1 FM_POLL=1 FM_SIGNAL_GRACE=0 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
-    secondmate_stall_watch_leg "$dir" "second" tick
+    secondmate_stall_watch_leg "$dir" "second" cleared
   [ ! -s "$state/.wake-queue" ] \
     || fail "declared external-wait rows fed the secondmate wake-loop escalation"
   ! grep -F 'secondmate wake-loop stalled' "$dir/watch-first.out" "$dir/watch-second.out" >/dev/null \
